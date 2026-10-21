@@ -265,7 +265,7 @@
     const db=await database();let previous;
     try{previous=await readStored(db,'worlds',world.id);}catch(error){if(!error.storageStore)throw error;}
     world.savedAt=new Date().toISOString();
-    const catalog={id:world.id,name:world.name,altname:world.altname,year:world.year,width:world.width,height:world.height,mapImage:world.mapImage||world.generatedMapImage||'',savedAt:world.savedAt,sourceFiles:world.sourceFiles,disk:world.disk?{id:world.disk.id}:undefined};
+    const catalog={id:world.id,name:world.name,altname:world.altname,year:world.year,width:world.width,height:world.height,mapImage:world.mapImage||world.generatedMapImage||'',hasImportedMap:Boolean(world.mapImage),savedAt:world.savedAt,sourceFiles:world.sourceFiles,disk:world.disk?{id:world.disk.id}:undefined};
     const values=await Promise.all([packed(world),packed(catalog)]),tx=db.transaction(['worlds','catalog'],'readwrite'),done=transactionDone(tx);
     tx.objectStore('worlds').put(values[0]);tx.objectStore('catalog').put(values[1]);await done;
     if(previous?.disk?.id&&previous.disk.id!==world.disk?.id)await abortImport(previous.disk.id);
@@ -274,11 +274,17 @@
     const db=await database(),catalog=[],catalogKeys=await requestResult(db.transaction('catalog').objectStore('catalog').getAllKeys());
     for(const key of catalogKeys){const row=await readStored(db,'catalog',key);if(row)catalog.push(row);}
     const known=new Set(catalog.map(row=>row.id)),keys=await requestResult(db.transaction('worlds').objectStore('worlds').getAllKeys());
-    for(const key of keys){if(known.has(key))continue;const world=await readStored(db,'worlds',key);if(world&&!world.demo){await saveWorld(world);catalog.push({id:world.id,name:world.name,altname:world.altname,year:world.year,width:world.width,height:world.height,mapImage:world.mapImage||world.generatedMapImage||'',savedAt:world.savedAt,sourceFiles:world.sourceFiles});}}
+    for(const key of keys){if(known.has(key))continue;const world=await readStored(db,'worlds',key);if(world&&!world.demo){await saveWorld(world);catalog.push({id:world.id,name:world.name,altname:world.altname,year:world.year,width:world.width,height:world.height,mapImage:world.mapImage||world.generatedMapImage||'',hasImportedMap:Boolean(world.mapImage),savedAt:world.savedAt,sourceFiles:world.sourceFiles});}}
     return catalog.sort((a,b)=>String(b.savedAt||'').localeCompare(String(a.savedAt||'')));
   }
   async function deleteWorld(id){const db=await database(),world=await readStored(db,'worlds',id);const tx=db.transaction(['worlds','catalog'],'readwrite'),done=transactionDone(tx);tx.objectStore('worlds').delete(id);tx.objectStore('catalog').delete(id);await done;if(world?.disk?.id)await abortImport(world.disk.id);}
-  const api={database,getWorld,createImport,abortImport,getRecord,query,related,prefetchRefs,totalFor,saveWorld,bookmarks,deleteWorld,references};
+  async function clearCache(worlds,all=false){
+    const db=await database(),stores=all?['worlds','catalog','records','payloads']:['records','payloads'],live=new Set(worlds.filter(world=>world.disk?.format!=='file-index').map(world=>world.disk?.id).filter(Boolean));let removed=0;
+    const tx=db.transaction(stores,'readwrite'),done=transactionDone(tx);
+    for(const name of stores){const store=tx.objectStore(name);if(all){store.clear();continue;}const request=store.openKeyCursor();request.onsuccess=()=>{const cursor=request.result;if(!cursor)return;if(!live.has(cursor.primaryKey[0])){store.delete(cursor.primaryKey);removed++;}cursor.continue();};}
+    await done;return removed;
+  }
+  const api={database,getWorld,createImport,abortImport,getRecord,query,related,prefetchRefs,totalFor,saveWorld,bookmarks,deleteWorld,clearCache,references};
   Object.defineProperty(api,'workerSource',{value:(global.LegendsStorageValues?.workerSource||'')+'('+installLegendsLocalStore.toString()+')(self);'});
   global.LegendsLocalStore=Object.freeze(api);
 })(typeof window==='undefined'?self:window);

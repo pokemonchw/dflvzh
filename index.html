@@ -31,6 +31,7 @@
   <script src="js/local-store.js" defer></script>
   <script src="js/file-indexer.js" defer></script>
   <script src="js/fast-store.js" defer></script>
+  <script src="js/import-pipeline.js" defer></script>
   <script src="js/import-client.js" defer></script>
   <script src="js/map.js" defer></script>
   <script src="js/upstream-ui.js" defer></script>
@@ -57,6 +58,9 @@
       <div class="import-tips"><i class="mdi mdi-information" aria-hidden="true"></i><p>选择主导出文件（legends.xml），并同时选择同次导出的 legends_plus.xml 和地图图片。</p></div>
       <label class="file-field" id="drop-zone"><span>世界导出文件</span><input type="file" id="file-input" accept=".xml,.png,.jpg,.jpeg,.bmp,.webp" multiple></label>
       <div id="selected-files"></div>
+      <label class="file-field"><span>导入模式</span><select id="import-threads"><option value="2">双线程（解析与缓存写入并行）</option><option value="1">单线程（兼容模式）</option></select></label>
+      <p>超过 32 MiB 的 XML 使用磁盘索引和双线程流水线；小文件使用单个解析线程。</p>
+      <button class="button" type="button" data-export-import-diagnostic>导出上次导入诊断</button>
       <div class="import-progress" id="import-progress" hidden><div><span id="progress-text">正在载入世界…</span><span id="progress-value">0%</span></div><progress id="progress-bar" value="0" max="100"></progress></div>
       <p id="import-error" class="inline-error" role="alert" hidden></p>
     </div>

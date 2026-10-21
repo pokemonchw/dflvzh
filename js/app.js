@@ -388,10 +388,52 @@
   async function renderWorlds() {
     const generation=renderGeneration;
     const first=`<article class="world-card"><div class="world-image">${icon('mdi-earth-box-plus')}</div><h2>探索新世界</h2><p>选择导出的传说 XML 文件</p><div class="world-card-actions"><button class="button button-orange" data-action="import">${icon('mdi-earth')}选择</button></div></article>`;
-    $('#main').innerHTML=`<div class="world-cards">${first}</div>`;
+    $('#main').innerHTML=`<div class="world-cards">${first}</div><section class="section-card"><div class="section-body"><h3>本地缓存管理</h3><p>可删除世界缓存或地图底图；原始 XML 和图片文件不会被删除。清理前请关闭其他旧版本页面。</p><button class="button" data-cache-action="orphans">清理失败导入残留</button> <button class="button" data-cache-action="all">清空全部本地世界缓存</button><p id="cache-status" role="status"></p></div></section>`;
     try{state.bookmarks=await bookmarks();}catch{state.bookmarks=[];}
     if(generation!==renderGeneration)return;
-    $('.world-cards').insertAdjacentHTML('beforeend',state.bookmarks.map(w=>`<article class="world-card">${thumbnail(w)}<h2>${escape(worldName(w))}${w.width&&w.height?`<span class="chip world-size">${w.width} × ${w.height}</span>`:''}</h2><p>${escape(alternativeName(w)||'-')}</p><div class="world-card-actions"><button class="button ${state.world?.id===w.id?'button-green':'button-blue'}" data-load-world="${escape(w.id)}">${state.world?.id===w.id?'探索':'载入'}</button>${state.world?.id!==w.id?`<details class="bookmark-menu"><summary class="icon-button" aria-label="更多">${icon('mdi-dots-horizontal')}</summary><button class="button" data-delete-world="${escape(w.id)}">${icon('mdi-delete-outline')}删除书签</button></details>`:''}<span class="world-date">${escape(w.savedAt?new Date(w.savedAt).toLocaleDateString('zh-CN'):'')}</span></div></article>`).join(''));
+    $('.world-cards').insertAdjacentHTML('beforeend',state.bookmarks.map(w=>`<article class="world-card">${thumbnail(w)}<h2>${escape(worldName(w))}${w.width&&w.height?`<span class="chip world-size">${w.width} × ${w.height}</span>`:''}</h2><p>${escape(alternativeName(w)||'-')}</p><div class="world-card-actions"><button class="button ${state.world?.id===w.id?'button-green':'button-blue'}" data-load-world="${escape(w.id)}">${state.world?.id===w.id?'探索':'载入'}</button><details class="bookmark-menu"><summary class="icon-button" aria-label="更多">${icon('mdi-dots-horizontal')}</summary>${w.mapImage&&w.hasImportedMap!==false?`<button class="button" data-remove-map="${escape(w.id)}">${icon('mdi-map-remove')}删除导入地图</button>`:''}<button class="button" data-delete-world="${escape(w.id)}">${icon('mdi-delete-outline')}删除世界缓存</button></details><span class="world-date">${escape(w.savedAt?new Date(w.savedAt).toLocaleDateString('zh-CN'):'')}</span></div></article>`).join(''));
+  }
+  function cacheLock(mode,task){return navigator.locks?.request?navigator.locks.request('legends-cache-lifecycle',{mode},task):task();}
+  function releaseCurrentWorld(){
+    worldGeneration++;resetView();
+    for(const key of ['world','detailModel','familyWorld','diskCacheWorld','preparedRowsWorld','emptyPreparedRows','sourceRecovery'])state[key]=null;
+    for(const key of ['eventIndex','collectionDirectIndex','eventCollections','collectionParents','entityMemberCounts','sitesByCivilization','eventYearsByType','collectionIndex','diskRelated','diskPages','diskCached','diskBaseIndexes','preparedRows'])state[key]=new Map();
+    state.indexes={};state.names.clear();state.files=[];$('#file-input').value='';$('#selected-files').innerHTML='';state.heroic=[];state.bookmarks=[];state.favorites=new Set();state.route='explore';state.recordId=null;
+    storage.set('lastWorld','');history.replaceState(null,'',pathFor('explore'));
+  }
+  let cacheChannel;try{cacheChannel=new BroadcastChannel('legends-cache-changes');cacheChannel.onmessage=event=>{if(event.data?.all||state.world?.id===event.data?.id){releaseCurrentWorld();render();toast('另一个页面已修改缓存，请重新载入世界。');}};}catch(_){}
+  async function changeCache(action,id){
+    if(state.importing||state.cacheBusy)return toast('请等待导入完成或先取消导入。');
+    const messages={all:'清空本页面保存的全部世界、地图、索引和原文件缓存？之后需要重新导入 XML。原始文件不会被删除。',orphans:'清理失败或取消导入留下的缓存？已保存的世界将保留。',map:'删除此世界导入的地图底图？世界数据保留，之后可以重新导入图片。',world:'删除此世界及其地图、索引和原文件缓存？原始文件不会被删除。'};
+    if(!confirm(messages[action]))return;
+    state.cacheBusy=true;const status=$('#cache-status');if(status)status.textContent='正在等待后台任务完成并清理缓存…';
+    try{await cacheLock('exclusive',async()=>{
+      await Promise.allSettled([...(state.pendingSaves?.values()||[]),...[...(state.sourceRepairs?.values()||[])].map(entry=>entry.promise)]);
+      if(action==='map'){
+        const world=state.world?.id===id?state.world:await LegendsLocalStore.getWorld(id);
+        if(!world)throw new Error('找不到世界缓存。');
+        if(!world.mapImage)throw new Error('此世界没有导入地图，当前显示的是自动生成的底图。');
+        const fileName=world.mapFileName,previous={sourceFiles:world.sourceFiles};
+        for(const key of ['mapImage','mapImageWidth','mapImageHeight','mapFileName','generatedMapImage']){previous[key]=world[key];delete world[key];}
+        if(fileName)world.sourceFiles=(world.sourceFiles||[]).filter(name=>name!==fileName);
+        try{LegendsMap.invalidate?.(world);await queueWorldSave(world);}catch(error){Object.assign(world,previous);LegendsMap.invalidate?.(world);throw error;}
+        await LegendsFastStore.removeMapSources(world);
+      }else if(action==='world'){
+        await LegendsLocalStore.deleteWorld(id);try{localStorage.removeItem('atlas.favorites.'+id);}catch(_){}
+        if(state.world?.id===id)releaseCurrentWorld();if(storage.get('lastWorld')===id)storage.set('lastWorld','');
+      }else{
+        const worlds=[];
+        if(action!=='all'){
+          for(const row of await bookmarks()){const world=await LegendsLocalStore.getWorld(row.id);if(!world)throw new Error('世界目录不完整，未清理缓存。');worlds.push({id:world.id,disk:world.disk});}
+          if(state.world)worlds.push({id:state.world.id,disk:state.world.disk});
+        }
+        await LegendsFastStore.clearOrphans(worlds,action==='all');await LegendsLocalStore.clearCache(worlds,action==='all');
+        if(action==='all'){releaseCurrentWorld();try{for(const key of Object.keys(localStorage))if(key.startsWith('atlas.favorites.'))localStorage.removeItem(key);}catch(_){}}
+      }
+      if(action!=='orphans')cacheChannel?.postMessage({id,all:action==='all'});
+    });render();toast(action==='map'?'导入地图已删除。':action==='world'?'世界缓存已删除。':'缓存清理完成。');}
+    catch(error){toast('清理失败：'+error.message);if(status?.isConnected)status.textContent='清理失败：'+error.message;}
+    finally{state.cacheBusy=false;}
   }
   function tableState(id) {if(!state.tables.has(id))state.tables.set(id,{page:1,pageSize:UI.pageSize||10,sortKey:'',descending:false});return state.tables.get(id);}
   function regionFor(record) {const id=record.region_id??record.subregion_id;return id===undefined?null:state.indexes.regions?.get(Number(id));}
@@ -693,6 +735,16 @@
   function importProgress(progress) {
     const percent=Math.max(0,Math.min(100,Number(progress.percent)||0));
     $('#progress-bar').value=percent;$('#progress-value').textContent=Math.round(percent)+'%';$('#progress-text').textContent=progress.message||'正在载入世界…';
+    const diagnostic=state.importDiagnostic;
+    if(diagnostic?.status==='running'&&(Date.now()-(diagnostic.updatedAt||0)>1000||diagnostic.phase!==progress.phase)){
+      Object.assign(diagnostic,{updatedAt:Date.now(),percent:Math.round(percent*10)/10,phase:progress.phase||'',message:progress.message||'',workers:window.LegendsImport?.getStatus?.().activeWorkers||0});
+      saveImportDiagnostic(diagnostic);
+    }
+  }
+  function saveImportDiagnostic(diagnostic){if(state.importDiagnostic!==diagnostic)return;try{localStorage.setItem('atlas.importDiagnostic',JSON.stringify(diagnostic));}catch(_){}}
+  function exportImportDiagnostic(){
+    const text=localStorage.getItem('atlas.importDiagnostic')||JSON.stringify({message:'暂无导入诊断，请先导入一次世界。'}),url=URL.createObjectURL(new Blob([text],{type:'application/json'})),link=document.createElement('a');
+    link.href=url;link.download='Legends-导入诊断.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
   }
   function releaseImportControls(controller) {
     if(importController!==controller)return false;
@@ -725,9 +777,11 @@
     await setWorld(world,options);
     if(world.disk&&(world.disk.id!==previousId||world.disk.aggregates?.version!==previousVersion||world.disk.aggregates?.civilizationRacesVersion!==previousRaceVersion||world.disk.aggregates?.copiedWorksVersion!==previousCopiedWorksVersion))await queueWorldSave(world);
   }
-  async function startImport() {
+  function startImport(){if(state.importing||state.cacheBusy)return;return cacheLock('shared',runStartImport);}
+  async function runStartImport() {
     if(state.importing||!state.files.length)return;
     const controller=new AbortController(),importFiles=state.files.slice();importController=controller;state.importing=true;$('#start-import').disabled=true;$('#close-import').disabled=false;$('#close-import').textContent='取消';$('#file-input').disabled=true;$('#import-error').hidden=true;$('#import-progress').hidden=false;
+    const diagnostic={version:'local-pipeline-1',status:'running',startedAt:new Date().toISOString(),browser:navigator.userAgent,threads:Number($('#import-threads').value)||2,files:importFiles.map(file=>({name:file.name,size:file.size})),percent:0};state.importDiagnostic=diagnostic;saveImportDiagnostic(diagnostic);
     importProgress({percent:0,message:'准备读取世界…'});
     let importedWorld;
     try{
@@ -737,7 +791,7 @@
         await LegendsFastStore.rebindSourceFiles(recovery.world,importFiles);checkAbort(controller.signal);
         state.sourceRecovery=null;
         if(state.world!==recovery.world)await restoreWorld(recovery.world,{navigate:false,renderView:false,signal:controller.signal});
-        importProgress({percent:100,message:'原文件已重新关联'});render();$('#import-dialog').close();releaseImportControls(controller);queueSourceRepair(recovery.world,importFiles);return;
+        importProgress({percent:100,message:'原文件已重新关联'});render();$('#import-dialog').close();releaseImportControls(controller);await queueSourceRepair(recovery.world,importFiles);return;
       }
       const images=importFiles.filter(file=>/^image\/(?:png|jpeg|gif|webp|bmp)$/i.test(file.type)||/\.(?:png|jpe?g|gif|webp|bmp)$/i.test(file.name));
       if(images.length===importFiles.length){
@@ -750,21 +804,23 @@
         Object.assign(world,update);delete world.generatedMapImage;LegendsMap.invalidate?.(world);
         state.route='map';state.recordId=null;history.replaceState(null,'',pathFor('map'));
         importProgress({percent:100,message:'载入完成'});render();$('#import-dialog').close();releaseImportControls(controller);
-        queueWorldSave(world);return;
+        await queueWorldSave(world);return;
       }
-      const world=await LegendsData.parseFiles(importFiles,progress=>{if(importController===controller&&!controller.signal.aborted)importProgress({...progress,percent:(Number(progress.percent)||0)*.9});},{signal:controller.signal});
+      const world=await LegendsData.parseFiles(importFiles,progress=>{if(importController===controller&&!controller.signal.aborted)importProgress({...progress,percent:(Number(progress.percent)||0)*.9});},{signal:controller.signal,threads:Number($('#import-threads').value)||2});
       importedWorld=world;checkAbort(controller.signal);
       await setWorld(world,{navigate:true,renderView:false,onProgress:progress=>{if(importController===controller&&!controller.signal.aborted)importProgress(progress);},signal:controller.signal});
       importProgress({percent:100,message:'载入完成'});render();$('#import-dialog').close();releaseImportControls(controller);
-      queueWorldSave(world,importFiles);
+      await queueWorldSave(world,importFiles);
     }catch(error){
+      diagnostic.status=error.name==='AbortError'?'cancelled':'failed';diagnostic.error=String(error.message||error);saveImportDiagnostic(diagnostic);
       if(importedWorld?.disk&&state.world!==importedWorld)Promise.resolve().then(()=>LegendsLocalStore.abortImport(importedWorld.disk.id)).catch(()=>{});
       if(importController!==controller)return;
       if(error.name==='AbortError'){$('#import-dialog').close();$('#import-progress').hidden=true;}else{$('#import-error').textContent=error.message||'无法载入世界。';$('#import-error').hidden=false;}
     }
-    finally{releaseImportControls(controller);}
+    finally{if(diagnostic.status==='running'){diagnostic.status=controller.signal.aborted?'cancelled':'complete';diagnostic.updatedAt=Date.now();saveImportDiagnostic(diagnostic);}releaseImportControls(controller);}
   }
-  async function loadWorld(id,{navigate=true,renderView=true}={}) {
+  function loadWorld(id,options){if(state.cacheBusy)return;return cacheLock('shared',()=>runLoadWorld(id,options));}
+  async function runLoadWorld(id,{navigate=true,renderView=true}={}) {
     if(state.importing)return;
     if(state.world?.id===id){if(navigate){state.route='overview';state.recordId=null;history.replaceState(null,'',pathFor('overview'));}if(renderView)render();return;}
     const controller=new AbortController();importController=controller;state.importing=true;$('#import-dialog').showModal();$('#import-progress').hidden=false;$('#import-error').hidden=true;$('#start-import').disabled=true;$('#file-input').disabled=true;$('#close-import').disabled=false;$('#close-import').textContent='取消';importProgress({percent:0,message:'读取已保存的世界…'});
@@ -803,7 +859,10 @@
       const disabled=event.target.closest('[aria-disabled="true"]');if(disabled){event.preventDefault();return;}
       const action=event.target.closest('[data-action]');if(action?.dataset.action==='import')showImport();if(action?.dataset.action==='retry-view')render();if(action?.dataset.action==='close-expanded')$('#expanded-dialog').close();
       const load=event.target.closest('[data-load-world]');if(load)loadWorld(load.dataset.loadWorld);
-      const remove=event.target.closest('[data-delete-world]');if(remove){try{state.sourceRepairs?.get(remove.dataset.deleteWorld)?.controller.abort();await LegendsLocalStore.deleteWorld(remove.dataset.deleteWorld);if(storage.get('lastWorld')===remove.dataset.deleteWorld)storage.set('lastWorld','');renderWorlds();}catch{toast('无法删除书签。');}}
+      const remove=event.target.closest('[data-delete-world]');if(remove)await changeCache('world',remove.dataset.deleteWorld);
+      const removeMap=event.target.closest('[data-remove-map]');if(removeMap)await changeCache('map',removeMap.dataset.removeMap);
+      const cache=event.target.closest('[data-cache-action]');if(cache)await changeCache(cache.dataset.cacheAction);
+      if(event.target.closest('[data-export-import-diagnostic]'))exportImportDiagnostic();
       const favorite=event.target.closest('[data-favorite]');if(favorite)toggleFavorite(favorite.dataset.favorite);
       const page=event.target.closest('[data-page-table]');if(page&&!page.disabled){tableState(page.dataset.pageTable).page=Number(page.dataset.page);updateTable(page.dataset.pageTable);}
       const sort=event.target.closest('[data-sort-table]');if(sort){const settings=tableState(sort.dataset.sortTable);if(settings.sortKey===sort.dataset.sortKey)settings.descending=!settings.descending;else{settings.sortKey=sort.dataset.sortKey;settings.descending=false;}settings.page=1;updateTable(sort.dataset.sortTable);}

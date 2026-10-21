@@ -10,18 +10,18 @@
   const active = new Set();
   const cleanups = new Set();
   const capability = {supported:null,mode:'idle',storage:'memory',format:'memory',reason:'',importsStarted:0,cleanupError:''};
-  const STARTUP_TIMEOUT = 3000, DISK_THRESHOLD = 128 * 1024 * 1024;
+  const STARTUP_TIMEOUT = 3000, DISK_THRESHOLD = 32 * 1024 * 1024;
 
   // Self-contained on purpose: this function is embedded into the Blob URL.
   // It must not close over main-thread variables, DOM APIs, or source files.
   function workerRuntime() {
     'use strict';
     const BATCH_SIZE = 512;
-    let busy = false, sequence = 0, acknowledge = null, store = null, importId = '';
+    let busy = false, sequence = 0, acknowledge = null, store = null, importId = '', pipeline = null;
     const fail = async error => {
       // The page owns cleanup after errors or termination. Report failure
       // before any potentially slow storage deletion can delay the UI.
-      self.postMessage({type:'error', error:serializeError(error)}); self.close();
+      pipeline?.close();self.postMessage({type:'error', error:serializeError(error)}); self.close();
     };
     const serializeError = error => ({name: String(error?.name || 'Error'), message: String(error?.message || error || '无法读取 XML。')});
     const send = payload => new Promise(resolve => {
@@ -42,8 +42,11 @@
         busy = true;
         try {
           importId = message.id;
-          store = await (message.storage === 'file-index' ? self.LegendsFastStore : self.LegendsLocalStore).createImport({id:importId,files:message.files});
-          busy = false; self.postMessage({type:'prepared', id:importId});
+          if(message.storage==='file-index'&&self.LegendsImportPipeline){
+            pipeline=await self.LegendsImportPipeline.createStore({id:importId,files:message.files},message.writerSource,message.threads!==1);
+            store=pipeline.store;
+          }else store = await (message.storage === 'file-index' ? self.LegendsFastStore : self.LegendsLocalStore).createImport({id:importId,files:message.files});
+          busy = false; self.postMessage({type:'prepared', id:importId,workers:pipeline?.workers||1});
         } catch (error) { await fail(error); }
         return;
       }
@@ -65,8 +68,11 @@
           });
           self.postMessage({type:'progress',progress:{...latestProgress,percent:85,phase:'store',message:'正在完成本地索引…'}});
           const compactWorld=await store.finish(metadata);
+          const image=message.files.find(file=>/^image\//i.test(file.type||'')||/\.(?:png|jpe?g|gif|webp|bmp)$/i.test(file.name||''));
+          if(image)await self.LegendsData.readMapImage(compactWorld,image);
           await self.LegendsFastStore.analytics(compactWorld,{progress:progress=>self.postMessage({type:'progress',progress:{...progress,percent:85+(Number(progress.percent)||0)*.14}})});
-          self.postMessage({type:'stored',id:importId,world:compactWorld,
+          await self.LegendsFastStore.putHandoff(importId,'import',compactWorld);
+          self.postMessage({type:'stored',id:importId,handoff:true,
             progress:{...latestProgress,percent:100,phase:'complete',message:'读取完成'}});
           return;
         }
@@ -127,6 +133,7 @@
       } catch (error) {
         await fail(error);
       } finally {
+        pipeline?.close();
         self.close();
       }
     };
@@ -173,14 +180,14 @@
       let settled = false, worker = null, url = null, startupTimer = 0, watchdogTimer = 0, started = false, lastHeartbeat = Date.now();
       let world = null, destinations = null, expectedLengths = null, storageSession = null, storagePromise = null;
       const controller = new AbortController();
-      const session = {worker:null}; active.add(session);
+      const session = {worker:null,workers:1}; active.add(session);
       const releaseUrl = () => {if (url) {global.URL.revokeObjectURL(url); url = null;}};
       const stopWorker = () => {
         global.clearTimeout(startupTimer); startupTimer = 0;
         global.clearInterval(watchdogTimer); watchdogTimer=0;
         global.document?.removeEventListener('visibilitychange',resetHeartbeat);
         if (worker) {worker.onmessage = null; worker.onerror = null; worker.onmessageerror = null; worker.terminate(); worker = null;}
-        session.worker = null; releaseUrl();
+        session.worker = null; session.workers=0; releaseUrl();
       };
       const resetHeartbeat=()=>{lastHeartbeat=Date.now();};
       const cleanupStorage = async () => {
@@ -240,6 +247,8 @@
             if(controller.signal.aborted)throw abortError();
             report({percent:85,phase:'store',execution:'main',message:'正在完成本地索引…'});
             const result=await storageSession.finish(metadata);
+            const image=files.find(file=>/^image\//i.test(file.type||'')||/\.(?:png|jpe?g|gif|webp|bmp)$/i.test(file.name||''));
+            if(image)await core.readMapImage(result,image,controller.signal);
             await global.LegendsFastStore.analytics(result,{signal:controller.signal,progress:progress=>report({...progress,percent:85+(Number(progress.percent)||0)*.14,execution:'main'})});
             if(controller.signal.aborted)throw abortError();
             report({percent:100,phase:'complete',execution:'main',message:'读取完成'});
@@ -262,12 +271,13 @@
       const source = typeof core.workerSource === 'string' ? core.workerSource : '';
       const storeSource = disk && typeof localStore.workerSource === 'string' ? localStore.workerSource : '';
       const indexerSource=fast&&typeof indexer.workerSource==='string'?indexer.workerSource:'';
+      const pipelineSource=global.LegendsImportPipeline?.workerSource||'';
       if (options.worker === false || disk && !storeSource || fast && !indexerSource || capability.supported === false || !source || typeof global.Worker !== 'function' || !global.Blob || !global.URL?.createObjectURL) {
         fallback(options.worker === false ? 'Worker disabled by caller' : !source ? 'Parser runtime is unavailable' : 'Worker is unavailable', options.worker !== false && !!source);
         return;
       }
       try {
-        url = global.URL.createObjectURL(new Blob([source, '\n', indexerSource, '\n', storeSource, '\n;(', workerRuntime.toString(), ')();\n'], {type:'text/javascript'}));
+        url = global.URL.createObjectURL(new Blob([source, '\n', indexerSource, '\n', storeSource, '\n',pipelineSource,'\n;(', workerRuntime.toString(), ')();\n'], {type:'text/javascript'}));
         worker = new Worker(url, {name:'Legends XML import'}); session.worker = worker;
       } catch (error) {fallback(error?.name || 'Worker startup failed', true); return;}
       startupTimer = global.setTimeout(() => {
@@ -282,7 +292,7 @@
         if (!started) fallback('Worker message cloning failed', true);
         else finish(new Error('无法接收导入数据。'));
       };
-      worker.onmessage = event => {
+      worker.onmessage = async event => {
         if (settled) return;
         lastHeartbeat=Date.now();
         const message = event.data;
@@ -301,14 +311,22 @@
             if (!message.capabilities?.images && files.some(file => /^image\//i.test(file.type || '') || /\.(?:png|jpe?g|gif|webp|bmp)$/i.test(file.name || ''))) {
               fallback('Image decoding is unavailable in this worker', false); return;
             }
-            try {worker.postMessage(disk ? {type:'prepare',storage:fast?'file-index':'disk',id:importId,files:fast?files:fileInfo} : {type:'parse',files}); started = true;}
+            try {worker.postMessage(disk ? {type:'prepare',storage:fast?'file-index':'disk',id:importId,files:fast?files:fileInfo,threads:options.threads===1?1:2,writerSource:fast?source+'\n'+indexerSource+'\n'+storeSource:''} : {type:'parse',files}); started = true;}
             catch (error) {fallback(error?.name || 'File handles could not be cloned', false);}
           } else if (message.type === 'heartbeat') {
             // Independent of parser/IndexedDB progress, including long IO.
           } else if (message.type === 'prepared') {
             if (!disk || message.id !== importId) throw new Error('本地存储准备消息无效。');
+            session.workers=message.workers||1;
+            report({percent:0,phase:'prepared',workers:session.workers,message:session.workers===2?'双线程已启动：解析与缓存写入并行':'单线程解析已启动'});
             worker.postMessage({type:'parse',storage:fast?'file-index':'disk',id:importId,files});
           } else if (message.type === 'stored') {
+            if(message.handoff){
+              if(!fast||message.id!==importId)throw new Error('本地结果标识无效。');
+              global.clearInterval(watchdogTimer);watchdogTimer=0;
+              message.world=await localStore.takeHandoff(importId,'import');
+              if(settled)return;
+            }
             if (!disk || message.id !== importId || !message.world || message.world.disk?.id !== importId) throw new Error('本地存储结果无效。');
             report({...message.progress,execution:'worker'}); if(!settled)finish(null,message.world);
           } else if (message.type === 'progress') {
@@ -348,7 +366,7 @@
       };
     });
   }
-  const getStatus = () => ({...capability,activeImports:active.size,activeWorkers:[...active].filter(session=>session.worker).length,pendingCleanups:cleanups.size});
+  const getStatus = () => ({...capability,activeImports:active.size,activeWorkers:[...active].reduce((sum,session)=>sum+(session.worker?session.workers:0),0),pendingCleanups:cleanups.size});
   global.LegendsImport = Object.freeze({parseFiles,getStatus,diskThreshold:DISK_THRESHOLD});
   // Preserve the original public API and every existing parser helper.
   global.LegendsData = Object.freeze({...core, parseFiles});

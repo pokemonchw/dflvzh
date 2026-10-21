@@ -73,16 +73,33 @@
   }
   async function unpack(value,options={}){
     check(options.signal);if(!isPacked(value))return value;
-    const payload=new Blob(value.chunks);
-    if(value.jsonBytes>payload.size)throw new Error('本地数据的编码长度无效。');
-    const envelope=JSON.parse(await payload.slice(0,value.jsonBytes).text());check(options.signal);
+    // Do not compose a new Blob from IndexedDB-owned Blob handles. Chromium
+    // can kill the renderer while resolving those handles across processes.
+    const total=value.chunks.reduce((sum,chunk)=>sum+chunk.size,0);
+    if(value.jsonBytes>total)throw new Error('本地数据的编码长度无效。');
+    let chunkNo=0,chunkOffset=0,current;
+    async function readBytes(size){
+      const bytes=new Uint8Array(size);let written=0;
+      while(written<size){
+        check(options.signal);
+        if(!current||chunkOffset===current.length){
+          if(chunkNo>=value.chunks.length)throw new Error('本地数据被截断。');
+          current=new Uint8Array(await value.chunks[chunkNo++].arrayBuffer());chunkOffset=0;
+          if(!current.length)continue;
+        }
+        const count=Math.min(size-written,current.length-chunkOffset);
+        bytes.set(current.subarray(chunkOffset,chunkOffset+count),written);written+=count;chunkOffset+=count;
+      }
+      return bytes;
+    }
+    const envelope=JSON.parse(new TextDecoder().decode(await readBytes(value.jsonBytes)));check(options.signal);
     if(!envelope||!Array.isArray(envelope.buffers)||!own(envelope,'value'))throw new Error('本地数据的编码结构无效。');
     const buffers=[];let offset=value.jsonBytes;
     for(const size of envelope.buffers){
-      if(!Number.isSafeInteger(size)||size<0||offset+size>payload.size)throw new Error('本地数据的二进制长度无效。');
-      buffers.push(await payload.slice(offset,offset+size).arrayBuffer());offset+=size;check(options.signal);
+      if(!Number.isSafeInteger(size)||size<0||offset+size>total)throw new Error('本地数据的二进制长度无效。');
+      buffers.push((await readBytes(size)).buffer);offset+=size;check(options.signal);
     }
-    if(offset!==payload.size)throw new Error('本地数据含有未识别的二进制内容。');
+    if(offset!==total)throw new Error('本地数据含有未识别的二进制内容。');
     function restore(item){
       if(!item||typeof item!=='object')return item;
       if(own(item,VALUE_TAG)&&Object.keys(item).length===1){

@@ -7,3 +7,5 @@ Thumbs.db
 .env.*
 *-legends.xml
 *-legends_plus.xml
+tests/node_modules/
+tests/local-deployment-results.json

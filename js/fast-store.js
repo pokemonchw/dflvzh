@@ -75,7 +75,7 @@
         check(signal);let old;try{old=await readValue(db,'sources',[id,fileNo],{signal,retries:1});}catch(error){if(error.name==='AbortError')throw error;}previous.push(old);
         const token=crypto.randomUUID(),manifest={importId:id,fileNo,format:'source-chunks-v1',name:file.name,size:file.size,type:file.type||'',lastModified:Number(file.lastModified)||0,chunkSize:SOURCE_CHUNK_BYTES,chunkCount:Math.ceil(file.size/SOURCE_CHUNK_BYTES),token};staged.push(manifest);
         for(let chunkNo=0;chunkNo<manifest.chunkCount;chunkNo++){
-          check(signal);const start=chunkNo*SOURCE_CHUNK_BYTES,end=Math.min(file.size,start+SOURCE_CHUNK_BYTES),part=file.slice(start,end),blob=part instanceof Blob?part:new Blob([await part.arrayBuffer({signal})]);check(signal);
+          check(signal);const start=chunkNo*SOURCE_CHUNK_BYTES,end=Math.min(file.size,start+SOURCE_CHUNK_BYTES),part=file.slice(start,end),blob=new Blob([await part.arrayBuffer({signal})]);check(signal);
           activeTx=db.transaction('sources','readwrite',{durability:'relaxed'});const saved=done(activeTx);activeTx.objectStore('sources').put({importId:id,fileNo:[fileNo,token,chunkNo],blob});await saved;activeTx=null;bytesWritten+=end-start;progress('persist');
         }
       }
@@ -170,7 +170,7 @@
     }
     return {id,writeBlock,metadata(key,value){metadata[key]=value;},finish,persistSources:options=>persistSourceFiles(id,files,options),abort:()=>abortImport(id)};
   }
-  async function abortImport(id,options={}){const name=options.dbName||CURRENT_DATABASE,db=await database(name),tx=db.transaction(['sources','blocks',...(db.objectStoreNames.contains('derived')?['derived']:[])],'readwrite'),saved=done(tx),range=IDBKeyRange.bound([id],[id,[]]);if(!options.keepSources){const cursor=tx.objectStore('sources').openKeyCursor(IDBKeyRange.lowerBound([id]));cursor.onsuccess=()=>{const entry=cursor.result;if(entry&&entry.key[0]===id){tx.objectStore('sources').delete(entry.primaryKey);entry.continue();}};}tx.objectStore('blocks').delete(range);if(db.objectStoreNames.contains('derived')){tx.objectStore('derived').delete(id);tx.objectStore('derived').delete(id+':relations-v1');tx.objectStore('derived').delete(id+':sourceRoles-v1');}await saved;for(const key of [...filesCache.keys()])if(key.startsWith(name+':'+id+':'))filesCache.delete(key);for(const key of [...blockCache.keys()])if(key.startsWith(name+':'+id+':'))blockCache.delete(key);for(const [key,buffer]of sourceChunks)if(key.startsWith(name+':'+id+':')){sourceChunks.delete(key);sourceChunkCacheBytes-=buffer.size??buffer.byteLength;}}
+  async function abortImport(id,options={}){const name=options.dbName||CURRENT_DATABASE,db=await database(name),tx=db.transaction(['sources','blocks',...(db.objectStoreNames.contains('derived')?['derived']:[])],'readwrite'),saved=done(tx),range=IDBKeyRange.bound([id],[id,[]]);if(!options.keepSources){const cursor=tx.objectStore('sources').openKeyCursor(IDBKeyRange.lowerBound([id]));cursor.onsuccess=()=>{const entry=cursor.result;if(entry&&entry.key[0]===id){tx.objectStore('sources').delete(entry.primaryKey);entry.continue();}};}tx.objectStore('blocks').delete(range);if(db.objectStoreNames.contains('derived')){tx.objectStore('derived').delete(id);tx.objectStore('derived').delete(id+':relations-v1');tx.objectStore('derived').delete(id+':sourceRoles-v1');for(const stage of ['writer','import','analytics'])tx.objectStore('derived').delete(id+':handoff:'+stage);}await saved;for(const key of [...filesCache.keys()])if(key.startsWith(name+':'+id+':'))filesCache.delete(key);for(const key of [...blockCache.keys()])if(key.startsWith(name+':'+id+':'))blockCache.delete(key);for(const [key,buffer]of sourceChunks)if(key.startsWith(name+':'+id+':')){sourceChunks.delete(key);sourceChunkCacheBytes-=buffer.size??buffer.byteLength;}}
   async function getBlock(world,group,blockNo,options={}){
     check(options.signal);
     const name=world.disk.dbName||LEGACY_DATABASE,key=name+':'+world.disk.id+':'+group+':'+blockNo;
@@ -190,7 +190,7 @@
     check(options.signal);const disk=world.disk,name=disk.sourceDbName||disk.dbName||LEGACY_DATABASE,id=disk.sourceId||disk.id,key=name+':'+id+':'+fileNo+':'+manifest.token+':'+chunkNo;
     if(sourceChunks.has(key)){const buffer=sourceChunks.get(key);sourceChunks.delete(key);sourceChunks.set(key,buffer);return buffer;}
     if(sourceChunkReads.has(key))return sharedRead(sourceChunkReads,key,options.signal,()=>readSourceChunk(world,fileNo,manifest,chunkNo,options));
-    const task=(async()=>{try{const db=await database(name),part=await readValue(db,'sources',[id,[fileNo,manifest.token,chunkNo]],options),expected=Math.min(manifest.chunkSize,manifest.size-chunkNo*manifest.chunkSize);check(options.signal);if(!(part?.blob instanceof Blob)||part.blob.size!==expected)throw new Error('原文件分块不存在或长度不符。');sourceChunks.set(key,part.blob);sourceChunkCacheBytes+=part.blob.size;while(sourceChunkCacheBytes>SOURCE_CHUNK_CACHE_BYTES&&sourceChunks.size>1){const oldest=sourceChunks.keys().next().value,payload=sourceChunks.get(oldest);sourceChunkCacheBytes-=payload.size??payload.byteLength;sourceChunks.delete(oldest);}return part.blob;}catch(error){if(error.name==='AbortError')throw error;throw sourceError(world,fileNo,error);}})();
+    const task=(async()=>{let release;try{const db=await database(name),part=await readValue(db,'sources',[id,[fileNo,manifest.token,chunkNo]],options),expected=Math.min(manifest.chunkSize,manifest.size-chunkNo*manifest.chunkSize);check(options.signal);if(!(part?.blob instanceof Blob)||part.blob.size!==expected)throw new Error('原文件分块不存在或长度不符。');release=await sourceReadSlot(options.signal);const buffer=await part.blob.arrayBuffer();check(options.signal);if(buffer.byteLength!==expected)throw new Error('原文件分块长度不符。');sourceChunks.set(key,buffer);sourceChunkCacheBytes+=buffer.byteLength;while(sourceChunkCacheBytes>SOURCE_CHUNK_CACHE_BYTES&&sourceChunks.size>1){const oldest=sourceChunks.keys().next().value,payload=sourceChunks.get(oldest);sourceChunkCacheBytes-=payload.size??payload.byteLength;sourceChunks.delete(oldest);}return buffer;}catch(error){if(error.name==='AbortError')throw error;throw sourceError(world,fileNo,error);}finally{release?.();}})();
     sourceChunkReads.set(key,task);try{return await task;}finally{if(sourceChunkReads.get(key)===task)sourceChunkReads.delete(key);}
   }
   async function readSourceRange(world,fileNo,manifest,chunkNo,from,to,options={}){
@@ -649,7 +649,7 @@
   function enrich(world,kind,record){const group=analyticGroup(kind),patch=sourceRoleCache.get(world)?.eventPatches?.[record.id];if(group==='events'&&patch)for(const [key,value]of Object.entries(patch))if(finiteId(record[key])===null)record[key]=value;Object.assign(record,metrics(world,kind,record));return record;}
   async function refreshFacts(world,options={}){
     if(!world.disk||Number(world.disk?.factsVersion||world.factsVersion)>=3)return world;
-    const files=await Promise.all((world.disk.fileInfo||[]).map((_,index)=>getSource(world,index,options))),importId=world.disk.id+'-facts-'+Date.now();
+    const files=await Promise.all((world.disk.fileInfo||[]).map((info,index)=>/\.xml$/i.test(info.name||'')?getSource(world,index,options):new File([],info.name||'image'))),importId=world.disk.id+'-facts-'+Date.now();
     options.onImportId?.(importId);const session=await createImport({id:importId,files});
     try{const metadata=await global.LegendsFileIndexer.indexFiles(files,{signal:options.signal,onBlock:session.writeBlock,onMetadata:session.metadata,progress:progress=>options.progress?.({...progress,phase:'facts',message:'正在补齐统计索引…'})});const replacement=await session.finish(metadata);const disk=replacement.disk;disk.sourceId=world.disk.sourceId||world.disk.id;disk.sourceDbName=world.disk.sourceDbName||world.disk.dbName||LEGACY_DATABASE;disk.sourcesPersisted=world.disk.sourcesPersisted!==false;for(const key of groups)world[key]=replacement[key];world.extra=replacement.extra;world.disk=disk;world.factsVersion=3;return world;}catch(error){await session.abort();throw error;}
   }
@@ -807,12 +807,12 @@
   }
   function analyticsWorker(world,options){
     const source=global.LegendsData.workerSource+(global.LegendsLocalStore?.workerSource||'')+global.LegendsFileIndexer.workerSource+global.LegendsFastStore.workerSource+`
-self.onmessage=async function(message){const world=message.data;const originalId=world.disk?.id;try{await LegendsFastStore.analytics(world,{progress:value=>postMessage({type:'progress',value}),onImportId:id=>postMessage({type:'import',id})});postMessage({type:'complete',aggregates:world.disk?.aggregates||world.aggregates,replacement:world.disk?.id!==originalId?world:null});}catch(error){const details={};for(const key of ['sourceDbName','sourceId','fileNo','expectedName','expectedSize','worldId','importId','dbName','group','blockNo','storageStore','storageDb','storageKey'])if(error[key]!==undefined)details[key]=error[key];postMessage({type:'error',message:error.message,name:error.name,stack:error.stack,details});}};`;
+self.onmessage=async function(message){const world=message.data;const originalId=world.disk?.id;try{await LegendsFastStore.analytics(world,{progress:value=>postMessage({type:'progress',value}),onImportId:id=>postMessage({type:'import',id})});if(world.disk){const name=world.disk.dbName||'legends-file-index';await LegendsFastStore.putHandoff(world.disk.id,'analytics',world,name);postMessage({type:'complete',handoff:true,id:world.disk.id,name,replaced:world.disk.id!==originalId});}else postMessage({type:'complete',aggregates:world.aggregates});}catch(error){const details={};for(const key of ['sourceDbName','sourceId','fileNo','expectedName','expectedSize','worldId','importId','dbName','group','blockNo','storageStore','storageDb','storageKey'])if(error[key]!==undefined)details[key]=error[key];postMessage({type:'error',message:error.message,name:error.name,stack:error.stack,details});}};`;
     return new Promise((resolve,reject)=>{
       check(options.signal);const url=URL.createObjectURL(new Blob([source],{type:'text/javascript'}));let worker,newId,settled=false;
       const finish=(error,value)=>{if(settled)return;settled=true;worker?.terminate();URL.revokeObjectURL(url);options.signal?.removeEventListener('abort',abort);if(error){if(newId)abortImport(newId).catch(()=>{});reject(error);}else resolve(value);};
       const abort=()=>finish(abortError());
-      try{worker=new Worker(url);worker.onmessage=message=>{const data=message.data;if(data.type==='progress')options.progress?.(data.value);else if(data.type==='import'){newId=data.id;options.onImportId?.(newId);}else if(data.type==='error'){const error=new Error(data.message);error.name=data.name;error.stack=data.stack;Object.assign(error,data.details||{});finish(error);}else if(data.type==='complete'){if(data.replacement){for(const key of groups)world[key]=data.replacement[key];world.extra=data.replacement.extra;world.disk=data.replacement.disk;world.factsVersion=3;}finish(null,applyAnalytics(world,data.aggregates));}};worker.onerror=event=>finish(new Error(event.message||'统计任务失败。'));options.signal?.addEventListener('abort',abort,{once:true});worker.postMessage(world);}catch(error){finish(error);}
+      try{worker=new Worker(url);worker.onmessage=async message=>{const data=message.data;try{if(data.handoff){const result=await takeHandoff(data.id,'analytics',data.name);if(settled)return;data.aggregates=result.disk.aggregates;if(data.replaced)data.replacement=result;}if(data.type==='progress')options.progress?.(data.value);else if(data.type==='import'){newId=data.id;options.onImportId?.(newId);}else if(data.type==='error'){const error=new Error(data.message);error.name=data.name;error.stack=data.stack;Object.assign(error,data.details||{});finish(error);}else if(data.type==='complete'){if(data.replacement){for(const key of groups)world[key]=data.replacement[key];world.extra=data.replacement.extra;world.disk=data.replacement.disk;world.factsVersion=3;}finish(null,applyAnalytics(world,data.aggregates));}}catch(error){finish(error);}};worker.onerror=event=>finish(new Error(event.message||'统计任务失败。'));options.signal?.addEventListener('abort',abort,{once:true});worker.postMessage(world);}catch(error){finish(error);}
     });
   }
   async function analytics(world,options={}){
@@ -828,10 +828,41 @@ self.onmessage=async function(message){const world=message.data;const originalId
     })();analyticsTasks.set(world,task);try{return await task;}finally{if(analyticsTasks.get(world)===task)analyticsTasks.delete(world);}
   }
 
+  // Large worker results stay in IndexedDB. Only their identifier crosses IPC.
+  async function putHandoff(id,stage,world,name=CURRENT_DATABASE){
+    const value=await packValue({importId:id+':handoff:'+stage,world}),db=await database(name),tx=db.transaction('derived','readwrite'),saved=done(tx);
+    tx.objectStore('derived').put(value);await saved;
+  }
+  async function removeMapSources(world){
+    const disk=world.disk;if(disk?.format!=='file-index')return;
+    const slots=new Set((disk.fileInfo||[]).flatMap((info,index)=>/\.(?:png|jpe?g|gif|webp|bmp)$/i.test(info.name||'')?[index]:[]));if(!slots.size)return;
+    const name=disk.sourceDbName||disk.dbName||LEGACY_DATABASE,id=disk.sourceId||disk.id,db=await database(name),tx=db.transaction('sources','readwrite'),saved=done(tx),store=tx.objectStore('sources'),request=store.openKeyCursor(IDBKeyRange.lowerBound([id]));
+    request.onsuccess=()=>{const cursor=request.result;if(!cursor||cursor.key[0]!==id)return;const slot=Array.isArray(cursor.key[1])?cursor.key[1][0]:cursor.key[1];if(slots.has(slot))store.delete(cursor.primaryKey);cursor.continue();};await saved;
+    for(const slot of slots){filesCache.delete(name+':'+id+':'+slot);for(const [key,buffer]of sourceChunks)if(key.startsWith(name+':'+id+':'+slot+':')){sourceChunks.delete(key);sourceChunkCacheBytes-=buffer.size??buffer.byteLength;}}
+  }
+  async function takeHandoff(id,stage,name=CURRENT_DATABASE){
+    const key=id+':handoff:'+stage,db=await database(name),value=await readValue(db,'derived',key);
+    if(!value?.world)throw new Error('导入结果不存在，请重新选择原 XML。');
+    const tx=db.transaction('derived','readwrite'),saved=done(tx);tx.objectStore('derived').delete(key);await saved;return value.world;
+  }
+  async function clearOrphans(worlds,all=false){
+    const listed=typeof indexedDB.databases==='function'?new Set((await indexedDB.databases()).map(row=>row.name)):null;
+    let removed=0;
+    for(const name of [CURRENT_DATABASE,LEGACY_DATABASE]){
+      if(listed&&!listed.has(name))continue;
+      const live=new Set();
+      for(const world of worlds){const disk=world.disk;if(!disk||disk.format!=='file-index')continue;if((disk.dbName||LEGACY_DATABASE)===name)live.add(disk.id);if((disk.sourceDbName||disk.dbName||LEGACY_DATABASE)===name)live.add(disk.sourceId||disk.id);}
+      const db=await database(name),stores=['sources','blocks','derived'].filter(store=>db.objectStoreNames.contains(store)),tx=db.transaction(stores,'readwrite'),saved=done(tx);
+      for(const storeName of stores){const store=tx.objectStore(storeName);if(all){store.clear();continue;}const request=store.openKeyCursor();request.onsuccess=()=>{const cursor=request.result;if(!cursor)return;const key=cursor.primaryKey,id=Array.isArray(key)?key[0]:String(key).replace(/:(?:relations-v1|sourceRoles-v1|handoff:.*)$/,'');if(!live.has(id)||storeName==='derived'&&String(key).includes(':handoff:')){store.delete(key);removed++;}cursor.continue();};}
+      await saved;
+    }
+    if(all){filesCache.clear();fileReads.clear();sourceChunks.clear();sourceChunkReads.clear();sourceRangeReads.clear();blockCache.clear();blockReads.clear();sourceChunkCacheBytes=0;}
+    return removed;
+  }
   async function scanHeaders(world,kind,visit,options={}){const d=descriptor(world,kind);return scan(world,d.group,header=>!d.types||d.types.includes(fold(header.type))?visit(header):undefined,options);}
   const headerSummary=(header,kind,world)=>{const record=summary(header,world?descriptor(world,kind).group:(own(aliases,kind)?'collections':extras[kind]||kind));return world?enrich(world,kind,record):record;};
   const getHeaders=(world,kind,id,options)=>headersFor(world,kind,id,options);
-  const api={database,relationshipReferences,registerSourceFiles,rebindSourceFiles,persistSourceFiles,persistReboundSources,readSourceFile:getSource,repairBlock,createImport,abortImport,prepareSourceRoles,getRecord,query,related,prefetchRefs,totalFor,scanHeaders,getHeaders,headerSummary,analytics,metrics,refreshFacts};Object.defineProperty(api,'workerSource',{value:(global.LegendsStorageValues?.workerSource||'')+'('+installLegendsFastStore.toString()+')(self);'});global.LegendsFastStore=Object.freeze(api);
+  const api={database,putHandoff,takeHandoff,clearOrphans,removeMapSources,relationshipReferences,registerSourceFiles,rebindSourceFiles,persistSourceFiles,persistReboundSources,readSourceFile:getSource,repairBlock,createImport,abortImport,prepareSourceRoles,getRecord,query,related,prefetchRefs,totalFor,scanHeaders,getHeaders,headerSummary,analytics,metrics,refreshFacts};Object.defineProperty(api,'workerSource',{value:(global.LegendsStorageValues?.workerSource||'')+'('+installLegendsFastStore.toString()+')(self);'});global.LegendsFastStore=Object.freeze(api);
   if(global.LegendsLocalStore){const base=global.LegendsLocalStore,wrapped={...base};for(const key of ['getRecord','query','related','prefetchRefs','totalFor'])wrapped[key]=function(world,...args){return world?.disk?.format==='file-index'?api[key](world,...args):base[key](world,...args);};wrapped.abortImport=async id=>{await Promise.all([api.abortImport(id),base.abortImport(id)]);};
     async function savedWorld(id){if(base.getWorld)return base.getWorld(id);const db=await base.database();return readValue(db,'worlds',id);}
     wrapped.saveWorld=async world=>{if(world.disk?.format==='file-index'&&world.disk.sourcesPersisted===false){const disk=world.disk,name=disk.sourceDbName||disk.dbName||LEGACY_DATABASE,id=disk.sourceId||disk.id,files=(disk.fileInfo||[]).map((_,index)=>filesCache.get(name+':'+id+':'+index));if(!files.length||files.some(file=>!file))throw new Error('世界原文件尚未保存，请重新选择原文件。');await persistSourceFiles(world,files);}let previous;try{previous=await savedWorld(world.id);}catch(error){if(error.storageStore!=='worlds')throw error;}await base.saveWorld(world);if(previous?.disk?.format==='file-index'&&previous.disk.id!==world.disk?.id)await api.abortImport(previous.disk.id,{dbName:previous.disk.dbName||LEGACY_DATABASE,keepSources:world.disk.sourceId===previous.disk.id&&world.disk.sourceDbName===(previous.disk.dbName||LEGACY_DATABASE)});};
